@@ -6,7 +6,7 @@ var builder = WebApplication.CreateBuilder(args);
 // Services
 builder.Services.AddSingleton<IFeatureService, InMemoryFeatureService>();
 builder.Services.AddScoped<IDataProvider, DummyDataProvider>();
-builder.Services.AddScoped<EligibilityChecker>();
+builder.Services.AddScoped<ChangeMembershipEligibilityChecker>();
 
 // Register Specifications
 builder.Services.AddScoped<IsUserProfileActiveRule>();
@@ -25,7 +25,7 @@ app.UseSwaggerUI();
 
 app.MapGet("/checkEligibility/{userId}", async (
     Guid userId,
-    EligibilityChecker checker,
+    ChangeMembershipEligibilityChecker checker,
     IsUserProfileActiveRule userActiveSpec,
     HasValidSubscriptionAndPaymentRule subAndPaySpec,
     ExternalServiceACheckSpec externalSpec,
@@ -34,9 +34,9 @@ app.MapGet("/checkEligibility/{userId}", async (
 ) =>
 {
     // Constructing the composite rule - using primary constructors implicitly
-    var subOrActivity = new OrRule(featureService, subAndPaySpec, activitySpec);
-    var mainChecks = new AndRule(featureService, userActiveSpec, subOrActivity);
-    var finalRule = new AndRule(featureService, mainChecks, externalSpec);
+    var subOrActivity = new OrEligibilityRule(subAndPaySpec, activitySpec);
+    var mainChecks = new AndEligibilityRule(userActiveSpec, subOrActivity);
+    var finalRule = new AndEligibilityRule(mainChecks, externalSpec);
 
     var result = await checker.CheckAsync(userId, finalRule, CancellationToken.None);
     return Results.Ok(result);
@@ -45,8 +45,6 @@ app.MapGet("/checkEligibility/{userId}", async (
 app.Run();
 
 
-// --- Data Dependencies Enum & Context ---
-// (No changes needed here)
 [Flags]
 public enum MembershipChangeDataDependency
 {
@@ -90,7 +88,6 @@ public class EligibilityCheckContext : IEligibilityCheckContext
     };
 }
 
-// Dummy classes for context properties (unchanged)
 public class UserProfile
 {
     public string Status { get; set; } = "Inactive";
@@ -111,9 +108,6 @@ public class Activity
     public DateTime Timestamp { get; set; }
 }
 
-
-// --- Feature Service & Data Provider Interfaces/Implementations ---
-// (No changes needed here)
 public interface IFeatureService
 {
     bool IsEnabled(string featureName);
@@ -219,7 +213,7 @@ public class EligibilityRuleResult : IEligibilityRuleResult
 
     public IEligibilityViolation? Violation { get; }
 
-    protected EligibilityRuleResult(IEligibilityViolation? violation)
+    private EligibilityRuleResult(IEligibilityViolation? violation)
     {
         Violation = violation;
     }
@@ -237,7 +231,7 @@ public class EligibilityRuleResult : IEligibilityRuleResult
 
 public class EligibilityViolation(IChangeMembershipEligibilityRule rule) : IEligibilityViolation
 {
-    public bool IsFromRule(IChangeMembershipEligibilityRule rule)
+    public bool IsFromRule(IChangeMembershipEligibilityRule specificRule)
     {
         return IsFromRule(rule.GetType());
     }
@@ -258,8 +252,14 @@ public interface IEligibilityRule<out TDependencies, in TContext> : IControlledF
     ValueTask<IEligibilityRuleResult> IsEligibleAsync(TContext context, CancellationToken ct);
 }
 
+public interface IBinaryEligibilityRule<out TDependencies, in TContext> : IDependencyDeclaration<TDependencies>
+{
+    ValueTask<IReadOnlyCollection<IEligibilityRuleResult>> IsEligibleAsync(TContext context, CancellationToken ct);
+}
+
 public interface IChangeMembershipEligibilityRule : IEligibilityRule<MembershipChangeDataDependency, IEligibilityCheckContext>;
 
+public interface IBinaryChangeMembershipEligibilityRule : IBinaryEligibilityRule<MembershipChangeDataDependency, IEligibilityCheckContext>;
 
 public abstract class ChangeMembershipEligibilityBaseRule<TRule>(IFeatureService featureService) : IChangeMembershipEligibilityRule
 {
@@ -347,7 +347,7 @@ public class HasRecentActivitySpec(IFeatureService featureService)
     }
 }
 
-public class AlwaysTrueRule(IFeatureService featureService) : ChangeMembershipEligibilityBaseRule<AlwaysTrueRule(featureService)
+public class AlwaysTrueRule(IFeatureService featureService) : ChangeMembershipEligibilityBaseRule<AlwaysTrueRule>(featureService)
 {
     public override MembershipChangeDataDependency GetDependencies() => MembershipChangeDataDependency.None;
 
@@ -357,106 +357,79 @@ public class AlwaysTrueRule(IFeatureService featureService) : ChangeMembershipEl
     }
 }
 
-
-public abstract class CompositeRule(IFeatureService featureService, params IEligibilityRule[] children)
-    : ChangeMembershipEligibilityBaseRule 
+public abstract class BinaryChangeMembershipEligibilityBaseRule<TLeftRule, TRightRule>(TLeftRule leftRule, TRightRule rightRule)
+    : IBinaryChangeMembershipEligibilityRule
+    where TLeftRule : IChangeMembershipEligibilityRule
+    where TRightRule : IChangeMembershipEligibilityRule
 {
-    protected readonly IEligibilityRule[] Children = children ?? throw new ArgumentNullException(nameof(children));
+    protected TLeftRule LeftRule = leftRule;
+    protected TRightRule RightRule = rightRule;
+
+    public MembershipChangeDataDependency GetDependencies()
+    {
+        return LeftRule.GetDependencies() | RightRule.GetDependencies();
+    }
+
+    public abstract ValueTask<IReadOnlyCollection<IEligibilityRuleResult>> IsEligibleAsync(IEligibilityCheckContext context, CancellationToken ct);
 }
 
-// Primary constructor used here too
-public class AndRule(IFeatureService featureService, IEligibilityRule left, IEligibilityRule right)
-    : CompositeRule(featureService, left, right)
+public class AndEligibilityRule<TLeftRule, TRightRule>(TLeftRule leftRule, TRightRule rightRule)
+    : BinaryChangeMembershipEligibilityBaseRule<TLeftRule, TRightRule>(leftRule, rightRule)
+    where TLeftRule : IChangeMembershipEligibilityRule
+    where TRightRule : IChangeMembershipEligibilityRule
 {
-    public override string Name => $"And({Children[0].Name},{Children[1].Name})"; // Example override
-    public override bool IsActive(IFeatureService fs) => Children[0].IsActive(fs) && Children[1].IsActive(fs);
-
-    public override MembershipChangeDataDependency GetDependencies(IFeatureService fs)
+    public override async ValueTask<IReadOnlyCollection<IEligibilityRuleResult>> IsEligibleAsync(
+        IEligibilityCheckContext context,
+        CancellationToken ct)
     {
-        if (!IsActive(fs)) return MembershipChangeDataDependency.None;
-        // Aggregate active children dependencies
-        return Children[0].GetDependencies(fs) | Children[1].GetDependencies(fs);
-    }
+        var leftRuleResult = await LeftRule.IsEligibleAsync(context, ct);
+        if (leftRuleResult.HasViolation) return new List<IEligibilityRuleResult> { leftRuleResult };
 
-    public override async Task<bool> IsEligibleAsync(IEligibilityCheckContext context, CancellationToken ct)
-    {
-        if (!IsActive(featureService)) return false; // Use captured featureService
-        // Short-circuit
-        return await Children[0].IsEligibleAsync(context, ct) && await Children[1].IsEligibleAsync(context, ct);
-    }
-}
+        var rightRuleResult = await RightRule.IsEligibleAsync(context, ct);
+        if (rightRuleResult.HasViolation) return new List<IEligibilityRuleResult> { rightRuleResult };
 
-public class OrRule(IFeatureService featureService, IEligibilityRule left, IEligibilityRule right)
-    : CompositeRule(featureService, left, right)
-{
-    public override string Name => $"Or({Children[0].Name},{Children[1].Name})";
-    public override bool IsActive(IFeatureService fs) => Children[0].IsActive(fs) || Children[1].IsActive(fs);
-
-    public override MembershipChangeDataDependency GetDependencies(IFeatureService fs)
-    {
-        if (!IsActive(fs)) return MembershipChangeDataDependency.None;
-        MembershipChangeDataDependency aggregated = MembershipChangeDataDependency.None;
-        // Must check each child individually as one might be active while the other isn't
-        if (Children[0].IsActive(fs)) aggregated |= Children[0].GetDependencies(fs);
-        if (Children[1].IsActive(fs)) aggregated |= Children[1].GetDependencies(fs);
-        return aggregated;
-    }
-
-    public override async Task<bool> IsEligibleAsync(EligibilityCheckContext context, CancellationToken ct)
-    {
-        if (!IsActive(featureService)) return false;
-
-        bool leftIsActive = Children[0].IsActive(featureService);
-        bool rightIsActive = Children[1].IsActive(featureService);
-
-        // Short-circuit if left is active and satisfies
-        if (leftIsActive && await Children[0].IsEligibleAsync(context, ct)) return true;
-        // Evaluate right only if it's active (and left didn't satisfy)
-        if (rightIsActive) return await Children[1].IsEligibleAsync(context, ct);
-
-        return false; // Neither active child satisfied
+        return new List<IEligibilityRuleResult> { EligibilityRuleResult.Pass() };
     }
 }
 
-// Primary constructor captures dependencies
-public class NotRule(IFeatureService featureService, IEligibilityRule operand)
-    : ChangeMembershipEligibilityBaseRule // Not technically composite, inherits Base directly
+public class OrEligibilityRule<TLeftRule, TRightRule>(TLeftRule leftRule, TRightRule rightRule)
+    : BinaryChangeMembershipEligibilityBaseRule<TLeftRule, TRightRule>(leftRule, rightRule)
+    where TLeftRule : IChangeMembershipEligibilityRule
+    where TRightRule : IChangeMembershipEligibilityRule
 {
-    public override string Name => $"Not({operand.Name})";
-
-    public override bool IsActive(IFeatureService fs) => operand.IsActive(fs);
-
-    public override MembershipChangeDataDependency GetDependencies(IFeatureService fs)
-        => IsActive(fs) ? operand.GetDependencies(fs) : MembershipChangeDataDependency.None;
-
-    public override async Task<bool> IsEligibleAsync(IEligibilityCheckContext context, CancellationToken ct)
+    public override async ValueTask<IReadOnlyCollection<IEligibilityRuleResult>> IsEligibleAsync(
+        IEligibilityCheckContext context,
+        CancellationToken ct)
     {
-        if (!IsActive(featureService)) return false; // Use captured featureService
-        return !await operand.IsEligibleAsync(context, ct);
+        var leftRuleResult = await LeftRule.IsEligibleAsync(context, ct);
+        if (!leftRuleResult.HasViolation) return new List<IEligibilityRuleResult> { leftRuleResult };
+
+        var rightRuleResult = await RightRule.IsEligibleAsync(context, ct);
+        if (rightRuleResult.HasViolation) return new List<IEligibilityRuleResult> { rightRuleResult };
+
+        return new List<IEligibilityRuleResult> { EligibilityRuleResult.Pass() };
     }
 }
 
-
-// --- REFACTORED Eligibility Checker ---
-// Uses primary constructor for dependencies
-public class EligibilityChecker(IDataProvider dataProvider, IFeatureService featureService)
+public class ChangeMembershipEligibilityChecker(IDataProvider dataProvider, IFeatureService featureService)
 {
-    public async Task<bool> CheckAsync(Guid userId, IEligibilityRule rootRule, CancellationToken ct)
+    public async ValueTask<bool> CheckAsync(Guid userId, IChangeMembershipEligibilityRule rule, CancellationToken ct)
     {
-        if (!rootRule.IsActive(featureService))
-        {
-            return false;
-        }
-
-        var requiredData = rootRule.GetDependencies(featureService);
-        if (requiredData == MembershipChangeDataDependency.None && !(rootRule is AlwaysTrueRule)) // Small optimization: Fetch only if needed
-        {
-            Console.WriteLine("No data dependencies identified, skipping fetch.");
-            // Execute without fetching if no data needed (handle AlwaysTrueRule potentially)
-            return await rootRule.IsEligibleAsync(new EligibilityCheckContext(), ct); // Pass empty context
-        }
-
+        var requiredData = rule.GetDependencies();
+        
         var dataContext = await dataProvider.FetchDataAsync(userId, requiredData, ct);
-        return await rootRule.IsEligibleAsync(dataContext, ct);
+        var result = await rule.IsEligibleAsync(dataContext, ct);
+
+        return result.HasViolation;
+    }
+    
+    public async ValueTask<bool> CheckAsync(Guid userId, IBinaryChangeMembershipEligibilityRule rule, CancellationToken ct)
+    {
+        var requiredData = rule.GetDependencies();
+        
+        var dataContext = await dataProvider.FetchDataAsync(userId, requiredData, ct);
+        var results = await rule.IsEligibleAsync(dataContext, ct);
+
+        return results.Any(result => result.HasViolation);
     }
 }
